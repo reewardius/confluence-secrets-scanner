@@ -99,6 +99,46 @@ def normalize_base_url(base_url):
         return f"{base_url}/wiki"
     return base_url
 
+def download_attachment_with_redirect(url, auth, download_headers, timeout=30):
+    """
+    Download an attachment following Atlassian's 302 redirect to api.media.atlassian.com.
+
+    Atlassian Cloud returns HTTP 302 from the REST download endpoint, redirecting to
+    api.media.atlassian.com/file/{fileId}/binary?token=... The token in the redirect
+    URL is already pre-authenticated, so we must NOT forward the Basic Auth header
+    to the media domain (it would be ignored or cause issues). We use a Session with
+    a response hook that strips Authorization on cross-domain redirects.
+    """
+    session = requests.Session()
+
+    def strip_auth_on_redirect(r, *args, **kwargs):
+        """Remove Authorization header when redirecting to a different host."""
+        if r.is_redirect:
+            redirect_url = r.headers.get("Location", "")
+            original_host = requests.utils.urlparse(url).netloc
+            redirect_host = requests.utils.urlparse(redirect_url).netloc
+            if redirect_host and redirect_host != original_host:
+                r.request.headers.pop("Authorization", None)
+
+    session.hooks["response"].append(strip_auth_on_redirect)
+
+    try:
+        resp = session.get(
+            url,
+            auth=auth,
+            headers=download_headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        return resp, None
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        return None, status
+    except Exception:
+        return None, -1
+
+
 def get_all_spaces(base_url, auth, headers):
     """Retrieve all spaces from Confluence."""
     all_spaces, start, limit = [], 0, 50
@@ -232,7 +272,7 @@ def get_attachments(base_url, auth, headers, page_id, created_in_years=None, mod
     """
     try:
         url = f"{base_url}/rest/api/content/{page_id}/child/attachment"
-        data = safe_request(url, headers, auth, params={"expand": "version,history"})
+        data = safe_request(url, headers, auth, params={"expand": "version,history,extensions,metadata"})
         if not data:
             return []
         
@@ -439,46 +479,93 @@ def format_secret_value(value, max_length=None):
         return value_str[:max_length] + "..."
     return value_str
 
-def extract_text_from_attachment(base_url, auth, headers, attachment, max_size_bytes, keywords, patterns, scan_images_only, archive_support):
-    """Extract text from various attachment types."""
+def _try_download_attachment(url, auth, download_headers):
+    """
+    Try to download an attachment from a single URL, following redirects.
+    Returns (response, error_code) where error_code is None on success.
+    Uses download_attachment_with_redirect to handle Atlassian's 302→Media API flow.
+    """
+    return download_attachment_with_redirect(url, auth, download_headers)
+
+
+def extract_text_from_attachment(base_url, auth, headers, attachment, max_size_bytes, keywords, patterns, scan_images_only, archive_support, cloud_id=None):
+    """Extract text from various attachment types.
+
+    Atlassian Cloud download flow (as of 2025):
+      REST endpoint → HTTP 302 → api.media.atlassian.com/file/{id}/binary?token=...
+    The token is embedded in the redirect URL so Basic Auth is NOT forwarded to the
+    media host. download_attachment_with_redirect() handles this automatically.
+    """
     att_title = attachment.get("title", "?")
-    download_url = f"{base_url}{attachment['_links'].get('download', '')}"
-    
+    att_id = attachment.get("id", "")  # e.g. "att2649589343"
+
     file_size = attachment.get("extensions", {}).get("fileSize", 0)
     if max_size_bytes and file_size > max_size_bytes:
         logging.info(f"Skipping {att_title} (size: {file_size} bytes > max: {max_size_bytes})")
         return [], ""
-    
+
     ext = os.path.splitext(att_title)[1][1:].lower()
-    
+
     if scan_images_only and ext not in ["png", "jpg", "jpeg", "gif", "bmp", "tiff"]:
         return [], ext
-    
+
+    # Use Accept: */* for binary downloads
+    download_headers = {k: v for k, v in headers.items() if k.lower() != "accept"}
+    download_headers["Accept"] = "*/*"
+
+    # Build candidate URL list — first working one wins.
+    # Each URL will follow 302 redirects automatically (including to Media API).
+    candidate_urls = []
+
+    if att_id:
+        # Best option: /rest/api/content/{page_id}/child/attachment/{att_id}/download
+        # Confluence returns 302 → api.media.atlassian.com with a pre-signed token.
+        container = attachment.get("_expandable", {}).get("container", "")
+        page_id_match = re.search(r'/content/(\d+)', container)
+        if page_id_match:
+            page_id_from_container = page_id_match.group(1)
+            candidate_urls.append(
+                f"{base_url}/rest/api/content/{page_id_from_container}/child/attachment/{att_id}/download"
+            )
+        # self link + /download (same mechanism)
+        self_link = attachment.get("_links", {}).get("self", "")
+        if self_link:
+            candidate_urls.append(f"{self_link}/download")
+
+    # Legacy URL as final fallback (may 401 on some tenants but worth trying)
+    legacy_url = f"{base_url}{attachment['_links'].get('download', '')}"
+    if legacy_url not in candidate_urls:
+        candidate_urls.append(legacy_url)
+
     try:
-        # Retry logic for 500 errors (Confluence occasionally returns 500 for images)
-        max_retries = 3
-        retry_delay = 10  # seconds
         response = None
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = requests.get(download_url, auth=auth, headers=headers, timeout=30)
-                response.raise_for_status()
-                break  # success
-            except requests.exceptions.HTTPError as e:
-                if response is not None and response.status_code == 500:
-                    if attempt < max_retries:
-                        logging.warning(
-                            f"500 Server Error for {att_title} "
-                            f"(attempt {attempt}/{max_retries}). "
-                            f"Retrying in {retry_delay}s..."
-                        )
-                        time.sleep(retry_delay)
-                    else:
-                        logging.error(f"Error extracting text from {att_title}: {e} — skipping after {max_retries} attempts")
-                        return [], ext
-                else:
-                    raise  # non-500 error, don't retry
+        retry_delay = 10
+
+        for url in candidate_urls:
+            logging.debug(f"Trying download URL for {att_title}: {url}")
+            resp, err_code = _try_download_attachment(url, auth, download_headers)
+
+            if resp is not None:
+                response = resp
+                logging.debug(f"Downloaded {att_title} via: {url}")
+                break
+            elif err_code == 500:
+                for attempt in range(2, 4):
+                    logging.warning(f"500 for {att_title} (attempt {attempt}/3), retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    resp, _ = _try_download_attachment(url, auth, download_headers)
+                    if resp is not None:
+                        response = resp
+                        break
+                if response:
+                    break
+                logging.error(f"500 persists for {att_title} at {url}, trying next URL...")
+            else:
+                logging.debug(f"HTTP {err_code} at {url} for {att_title}, trying next URL...")
+
+        if response is None:
+            logging.error(f"All download URLs failed for {att_title}. Tried: {candidate_urls}")
+            return [], ext
         
         content = response.content
         
@@ -573,13 +660,14 @@ def parse_size(size_str):
     return num * multipliers.get(unit, 1)
 
 def parse_date(date_str):
-    """Parse date string in D.M.Y or D/M/Y format."""
+    """Parse date string in D.M.Y or D/M/Y format, returns timezone-aware datetime."""
     for sep in [".", "/"]:
         if sep in date_str:
             parts = date_str.split(sep)
             if len(parts) == 3:
                 day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-                return datetime(year, month, day)
+                from datetime import timezone
+                return datetime(year, month, day, tzinfo=timezone.utc)
     raise ValueError(f"Invalid date format: {date_str}")
 
 def parse_age(age_str):
@@ -1341,7 +1429,7 @@ def validate_attachment_fields(space_name, page_title, file_title, ext, file_url
     return (safe_space_name, safe_page_title, safe_file_title, safe_ext, safe_file_url,
             safe_page_url, safe_keyword, safe_finding_type, safe_formatted_value, safe_email)
 
-def process_space(base_url, auth, headers, space, keywords, patterns, writer, csvfile, include_attachments, allowed_types, excluded_types, max_size_bytes, mod_after, mod_before, created_years, modified_in_years, no_duplicates, secret_max_length, scan_images_only, archive_support, findings_set, debug_limit=None, current_total=0):
+def process_space(base_url, auth, headers, space, keywords, patterns, writer, csvfile, include_attachments, allowed_types, excluded_types, max_size_bytes, mod_after, mod_before, created_years, modified_in_years, no_duplicates, secret_max_length, scan_images_only, archive_support, findings_set, debug_limit=None, current_total=0, cloud_id=None):
     """Process a single Confluence space."""
     space_key = space.get("key", "?")
     space_name = space.get("name", space_key).strip()
@@ -1355,7 +1443,7 @@ def process_space(base_url, auth, headers, space, keywords, patterns, writer, cs
     # Don't reopen file - use existing writer
     for page in pages:
         secrets_found, files_scanned = process_page(base_url, auth, headers, page, space_name, space_key, writer, csvfile, keywords, patterns, include_attachments, allowed_types, excluded_types, max_size_bytes, no_duplicates, secret_max_length,
-            scan_images_only, archive_support, findings_set, created_years, modified_in_years
+            scan_images_only, archive_support, findings_set, created_years, modified_in_years, cloud_id=cloud_id
         )
         total_secrets_in_space += secrets_found
         total_files_in_space += files_scanned
@@ -1372,7 +1460,7 @@ def process_space(base_url, auth, headers, space, keywords, patterns, writer, cs
     
     return total_secrets_in_space, total_files_in_space, total_pages_in_space
 
-def process_page(base_url, auth, headers, page, space_name, space_key, writer, csvfile, keywords, patterns, include_attachments, allowed_types, excluded_types, max_size_bytes, no_duplicates, secret_max_length, scan_images_only, archive_support, findings_set, created_years=None, modified_in_years=None):
+def process_page(base_url, auth, headers, page, space_name, space_key, writer, csvfile, keywords, patterns, include_attachments, allowed_types, excluded_types, max_size_bytes, no_duplicates, secret_max_length, scan_images_only, archive_support, findings_set, created_years=None, modified_in_years=None, cloud_id=None):
     """Process a single Confluence page."""
     title = page.get("title", "?")
     page_id = page.get("id", "?")
@@ -1391,13 +1479,19 @@ def process_page(base_url, auth, headers, page, space_name, space_key, writer, c
         for att in filtered_attachments:
             file_findings, ext = extract_text_from_attachment(
                 base_url, auth, headers, att, max_size_bytes, keywords, patterns,
-                scan_images_only, archive_support
+                scan_images_only, archive_support, cloud_id=cloud_id
             )
             if not file_findings:
                 continue
             for finding_type, keyword, matched_text in file_findings:
                 formatted_value = format_secret_value(matched_text, max_length=secret_max_length)
-                file_url = f"{base_url}{att['_links'].get('download', '')}"
+                # Use REST API download URL (Basic Auth compatible).
+                # Legacy /download/attachments/... now requires OAuth on Atlassian Cloud.
+                att_id = att.get("id", "")
+                if att_id:
+                    file_url = f"{base_url}/rest/api/content/{att_id}/download"
+                else:
+                    file_url = f"{base_url}{att['_links'].get('download', '')}"
                 email = get_last_editor_email(base_url, auth, headers, page_id)
                 
                 # Validate all attachment fields before writing to CSV
@@ -1560,8 +1654,30 @@ def main(base_url, username, token, keywords_file, regex_file, single_regex, out
         
         # Derive actual output filenames from -o base name
         output_base_both = re.sub(r'\.(csv|xlsx|json)$', '', output_file, flags=re.IGNORECASE)
-        xlsx_pages = output_base_both + "_pages.xlsx"
-        xlsx_files = output_base_both + "_files.xlsx"
+        output_dir_both = os.path.dirname(os.path.abspath(output_file))
+
+        # Internal names (generated by each recursive call)
+        xlsx_pages_internal = output_base_both + "_pages.xlsx"
+        xlsx_files_internal = output_base_both + "_files.xlsx"
+
+        # Final names that will be sent by email and shown in logs
+        xlsx_pages = os.path.join(output_dir_both, "confluence_secrets.xlsx")
+        xlsx_files = os.path.join(output_dir_both, "confluence_secrets_in_files.xlsx")
+
+        # Rename internal files to final names
+        for src, dst in [(xlsx_pages_internal, xlsx_pages), (xlsx_files_internal, xlsx_files)]:
+            if os.path.exists(src):
+                try:
+                    os.replace(src, dst)
+                    logging.info(f"Renamed {os.path.basename(src)} → {os.path.basename(dst)}")
+                except Exception as e:
+                    logging.warning(f"Could not rename {src} to {dst}: {e}")
+                    # Fall back to original name if rename failed
+                    if src == xlsx_pages_internal:
+                        xlsx_pages = src
+                    else:
+                        xlsx_files = src
+
         json_pages = output_base_both + "_pages.json"
         json_files = output_base_both + "_files.json"
 
@@ -1637,8 +1753,8 @@ Total Secrets Found: {total_secrets_combined}
 - Files: {total_secrets_files}
 
 Two separate reports are attached:
-1. {os.path.basename(xlsx_pages)} - Secrets found in page content
-2. {os.path.basename(xlsx_files)} - Secrets found in file attachments
+1. confluence_secrets.xlsx - Secrets found in page content
+2. confluence_secrets_in_files.xlsx - Secrets found in file attachments
 
 Please review both reports and take appropriate action.
 """
@@ -1781,6 +1897,10 @@ Please review both reports and take appropriate action.
     
     logging.info(f"Found/filtered spaces: {len(spaces)}")
 
+    # cloud_id is no longer needed: downloads use the 302-redirect mechanism
+    # (REST endpoint → api.media.atlassian.com with pre-signed token).
+    cloud_id = None
+
     findings_set = set() if no_duplicates else None
     
     total_secrets = 0
@@ -1824,7 +1944,7 @@ Please review both reports and take appropriate action.
                 include_attachments, allowed_types, excluded_types, max_size_bytes, 
                 mod_after, mod_before, created_years, modified_years, no_duplicates, 
                 secret_max_length, scan_images_only, archive_support, findings_set, 
-                debug_limit, total_secrets
+                debug_limit, total_secrets, cloud_id=cloud_id
             )
             total_secrets += secrets_in_space
             total_files += files_in_space
@@ -1858,7 +1978,9 @@ Please review both reports and take appropriate action.
     # Create XLSX report (name derived from -o base)
     output_dir = os.path.dirname(os.path.abspath(output_file))
     if include_attachments:
-        xlsx_file = output_base + "_files.xlsx" if mode == "files" else output_base + ".xlsx"
+        # In recursive call for files mode, output_file is already e.g. results_files.csv
+        # so we just use output_base + ".xlsx" to avoid double "_files_files"
+        xlsx_file = output_base + ".xlsx"
     else:
         xlsx_file = output_base + ".xlsx"
 
